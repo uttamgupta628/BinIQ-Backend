@@ -1,0 +1,136 @@
+const express = require("express");
+const mongoose = require("mongoose");
+const dotenv = require("dotenv");
+const cors = require("cors");
+const { v4: uuidv4 } = require("uuid");
+const Plan = require("./models/Plan");
+const userRoutes = require("./routes/userRoutes");
+const productRoutes = require("./routes/productRoutes");
+const categoryRoutes = require("./routes/categoryRoutes");
+const promotionRoutes = require("./routes/promotionRoutes");
+const storeRoutes = require("./routes/storeRoutes");
+const notificationRoutes = require("./routes/notificationRoutes");
+const faqRoutes = require("./routes/faqRoutes");
+const subscriptionRoutes = require("./routes/subscriptionRoutes");
+const statsRoutes = require("./routes/statsRoutes");
+const paymentRoutes = require("./routes/Paymentroutes");
+const exportRoutes = require("./routes/exportRoutes");
+const storeClaimRoutes = require("./routes/storeClaimRoutes");
+const adminClaimRoutes = require("./routes/adminClaimRoutes");
+
+// Load environment variables
+dotenv.config();
+
+const app = express();
+
+// ── Middleware ───────────────────────────────────────────────────
+app.use(cors());
+
+// ⚠️ Webhook raw body MUST be before express.json()
+app.use('/api/payments/webhook', express.raw({ type: 'application/json' }));
+
+// JSON body parser for all other routes
+app.use(express.json());
+
+// ── Routes ───────────────────────────────────────────────────────
+app.get("/", (req, res) => {
+  res.status(200).send("Welcome to the server");
+});
+
+app.use("/api/users", userRoutes);
+app.use("/api/products", productRoutes);
+app.use("/api/categories", categoryRoutes);
+app.use("/api/promotions", promotionRoutes);
+app.use("/api/stores", storeRoutes);
+app.use("/api/stores", storeClaimRoutes);  
+app.use("/api/admin", adminClaimRoutes);
+app.use("/api/faqs", faqRoutes);
+app.use("/api/notifications", notificationRoutes);
+app.use("/api/subscriptions", subscriptionRoutes);
+app.use("/api/stats", statsRoutes);
+app.use("/api/export", exportRoutes);
+app.use("/api/payments", paymentRoutes);  // ✅ AFTER express.json()
+
+// ── Global Error Handler ─────────────────────────────────────────
+app.get("/delete-account", (req, res) => {
+  res.send(`
+    <h1>Delete Account - BinIQ</h1>
+
+    <p>You can delete your account using the BinIQ app.</p>
+
+    <h3>Steps:</h3>
+    <ol>
+      <li>Login to your account</li>
+      <li>Go to Profile Settings</li>
+      <li>Click on "Delete Account"</li>
+    </ol>
+
+    <p>If you cannot access your account, contact us:</p>
+    <p>Email: support@biniq.com</p>
+
+    <h3>Data Deletion:</h3>
+    <ul>
+      <li>Personal data (name, email, phone, address) will be deleted</li>
+      <li>Your account will be permanently removed</li>
+      <li>Some data may be retained for up to 30 days for legal purposes</li>
+    </ul>
+  `);
+});
+app.use((err, req, res, next) => {
+  console.error("Error:", {
+    message: err.message,
+    stack: err.stack,
+    path: req.path,
+    method: req.method,
+    body: req.body,
+  });
+  res.status(err.status || 500).json({
+    message: err.message || "Internal Server Error",
+    status: err.status || 500,
+  });
+});
+
+// ── Database ─────────────────────────────────────────────────────
+mongoose
+  .connect(process.env.MONGODB_URI, {})
+  .then(async () => {
+  console.log("MongoDB connected successfully");
+
+  try {
+    await mongoose.connection.collection("stores").dropIndex("user_id_1");
+    console.log("Dropped unique user_id index on stores");
+  } catch (err) {
+    if (err.codeName !== "IndexNotFound") {
+      console.warn("Could not drop user_id index:", err.message);
+    }
+  }
+
+  initializePlans();
+})
+  .catch((err) => console.error("MongoDB connection error:", err.message));
+
+const initializePlans = async () => {
+  try {
+    const defaultPlans = [
+      { type: "reseller", tier: "tier1", amount: 10, duration: 30 },
+      { type: "reseller", tier: "tier2", amount: 20, duration: 90 },
+      { type: "reseller", tier: "tier3", amount: 30, duration: 180 },
+      { type: "store_owner", tier: "tier1", amount: 10, duration: 30 },
+      { type: "store_owner", tier: "tier2", amount: 20, duration: 90 },
+      { type: "store_owner", tier: "tier3", amount: 30, duration: 180 },
+    ];
+    for (const plan of defaultPlans) {
+      const exists = await Plan.findOne({ type: plan.type, tier: plan.tier });
+      if (!exists) {
+        await new Plan({ _id: uuidv4(), ...plan }).save();
+        console.log(`Initialized ${plan.type} ${plan.tier} plan`);
+      }
+    }
+  } catch (error) {
+    console.error("Failed to initialize plans:", error);
+  }
+};
+
+// ── Start Server ─────────────────────────────────────────────────
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
