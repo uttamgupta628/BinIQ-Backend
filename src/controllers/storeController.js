@@ -665,61 +665,70 @@ const bulkCreateStores = async (req, res) => {
   }
 
   const { stores } = req.body;
-
   if (!Array.isArray(stores) || stores.length === 0) {
     return res.status(400).json({ message: "stores array is required" });
   }
 
+  const BATCH_SIZE = 500; // process 500 at a time
   const results = { created: [], failed: [] };
 
+  // 1. Validate & build docs first (sync, fast)
+  const validDocs = [];
   for (const storeData of stores) {
-    try {
-      const {
-        store_name, address, city, state, zip_code,
-        store_email, facebook_link, daily_rates,
-      } = storeData;
+    const { store_name, address, city, state, zip_code,
+            store_email, facebook_link, daily_rates } = storeData;
 
-      if (!store_name) {
-        results.failed.push({ store_name: storeData.store_name ?? "(unknown)", reason: "store_name is required" });
+    if (!store_name) {
+      results.failed.push({ store_name: storeData.store_name ?? "(unknown)", reason: "store_name is required" });
+      continue;
+    }
+
+    let sanitisedRates = {};
+    if (daily_rates != null) {
+      const result = sanitiseDailyRates(daily_rates);
+      if (!result.valid) {
+        results.failed.push({ store_name, reason: result.error });
         continue;
       }
+      sanitisedRates = result.sanitised;
+    }
 
-      let sanitisedRates = {};
-      if (daily_rates != null) {
-        const result = sanitiseDailyRates(daily_rates);
-        if (!result.valid) {
-          results.failed.push({ store_name, reason: result.error });
-          continue;
-        }
-        sanitisedRates = result.sanitised;
-      }
+    validDocs.push({
+      _id:           require("uuid").v4(),
+      user_id:       "unassigned",
+      store_name,
+      address:       address       || null,
+      city:          city          || null,
+      state:         state         || null,
+      zip_code:      zip_code      || null,
+      store_email:   store_email   || null,
+      facebook_link: facebook_link || null,
+      daily_rates:   sanitisedRates,
+      verified:      false,
+      favorited_by:  [],
+      liked_by:      [],
+      followed_by:   [],
+      comments:      [],
+    });
+  }
 
-      const store = new Store({
-        _id: require("uuid").v4(),
-        user_id: "unassigned",   // ← sentinel: satisfies required, signals unclaimed store
-        store_name,
-        address:       address       || null,
-        city:          city          || null,
-        state:         state         || null,
-        zip_code:      zip_code      || null,
-        store_email:   store_email   || null,
-        facebook_link: facebook_link || null,
-        daily_rates:   sanitisedRates,
-        verified:      false,
-        favorited_by:  [],
-        liked_by:      [],
-        followed_by:   [],
-        comments:      [],
-      });
-
-      await store.save();
-      results.created.push({ store_name, store_id: store._id });
-
+  // 2. Insert in batches of 500
+  for (let i = 0; i < validDocs.length; i += BATCH_SIZE) {
+    const batch = validDocs.slice(i, i + BATCH_SIZE);
+    try {
+      const inserted = await Store.insertMany(batch, { ordered: false });
+      inserted.forEach(s => results.created.push({ store_name: s.store_name, store_id: s._id }));
     } catch (err) {
-      results.failed.push({
-        store_name: storeData.store_name ?? "(unknown)",
-        reason: err.message,
-      });
+      // ordered: false means partial inserts succeed; writeErrors has the failures
+      if (err.insertedDocs?.length) {
+        err.insertedDocs.forEach(s => results.created.push({ store_name: s.store_name, store_id: s._id }));
+      }
+      if (err.writeErrors?.length) {
+        err.writeErrors.forEach(e => results.failed.push({
+          store_name: batch[e.index]?.store_name ?? "(unknown)",
+          reason: e.errmsg,
+        }));
+      }
     }
   }
 
