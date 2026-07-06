@@ -97,26 +97,35 @@ app.use((err, req, res, next) => {
     status: err.status || 500,
   });
 });
+const PORT = process.env.PORT || 3001;
 
 // ── Database ─────────────────────────────────────────────────────
 mongoose
-  .connect(process.env.MONGODB_URI, {})
+  .connect(process.env.MONGODB_URI, {
+    serverSelectionTimeoutMS: 10000,
+  })
   .then(async () => {
-  console.log("MongoDB connected successfully");
+    console.log("MongoDB connected successfully");
 
-  try {
-    await mongoose.connection.collection("stores").dropIndex("user_id_1");
-    console.log("Dropped unique user_id index on stores");
-  } catch (err) {
-    if (err.codeName !== "IndexNotFound") {
-      console.warn("Could not drop user_id index:", err.message);
+    try {
+      await mongoose.connection.collection("stores").dropIndex("user_id_1");
+      console.log("Dropped unique user_id index on stores");
+    } catch (err) {
+      if (err.codeName !== "IndexNotFound") {
+        console.warn("Could not drop user_id index:", err.message);
+      }
     }
-  }
 
-  initializePlans();
-})
-  .catch((err) => console.error("MongoDB connection error:", err.message));
+    await initializePlans();
 
+    app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+  })
+  .catch((err) => {
+    console.error("MongoDB connection error:", err.message);
+    process.exit(1);
+  });
+
+// ── Plan initialization ──────────────────────────────────────────
 const initializePlans = async () => {
   try {
     const defaultPlans = [
@@ -138,7 +147,6 @@ const initializePlans = async () => {
     console.error("Failed to initialize plans:", error);
   }
 };
-
 // ── Start Server ─────────────────────────────────────────────────
-const PORT = process.env.PORT || 3001;
+
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
