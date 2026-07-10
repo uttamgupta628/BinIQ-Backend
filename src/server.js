@@ -106,6 +106,7 @@ mongoose
   })
   .then(async () => {
     console.log("MongoDB connected successfully");
+    console.log("Database:", mongoose.connection.db.databaseName);
 
     try {
       await mongoose.connection.collection("stores").dropIndex("user_id_1");
@@ -149,4 +150,4 @@ const initializePlans = async () => {
 };
 // ── Start Server ─────────────────────────────────────────────────
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

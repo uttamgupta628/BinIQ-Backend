@@ -65,6 +65,69 @@ const sanitiseDailyRates = (raw) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Geocoding helper for bulk store creation
+// ─────────────────────────────────────────────────────────────────────────────
+// ⚠️ Move this key to an environment variable (process.env.GOOGLE_MAPS_API_KEY)
+// — it should never be hardcoded/committed, and definitely never shipped in the
+// mobile app bundle the way it currently is in apiService.js / Dashboard2.js.
+const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || "AIzaSyCY-8_-SbCN29nphT9QFtbzWV5H3asJQ4Q";
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const geocodeAddress = async (addressParts) => {
+  const address = addressParts.filter(Boolean).join(", ");
+  if (!address || !GOOGLE_MAPS_API_KEY) return null;
+  try {
+    const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(
+      address,
+    )}&key=${GOOGLE_MAPS_API_KEY}`;
+    const res = await fetch(url);
+    const json = await res.json();
+    if (json.status === "OK" && json.results?.length > 0) {
+      const { lat, lng } = json.results[0].geometry.location;
+      return { latitude: lat, longitude: lng };
+    }
+    if (json.status === "OVER_QUERY_LIMIT") {
+      // back off and let the caller retry
+      return { rateLimited: true };
+    }
+  } catch (err) {
+    console.error("Geocode error for", address, err.message);
+  }
+  return null;
+};
+
+/**
+ * Geocode a batch of docs sequentially with a small delay between calls
+ * (Google's free tier allows ~50 requests/sec, but bursts of many
+ * concurrent Promise.all calls get silently rejected/rate-limited —
+ * this is why only a handful of bulk-uploaded stores used to get
+ * coordinates). Docs that already have lat/lng (from LATITUDE/LONGITUDE
+ * columns in the sheet) are skipped entirely.
+ */
+const geocodeDocsInPlace = async (docs) => {
+  for (const doc of docs) {
+    if (doc.user_latitude && doc.user_longitude) continue; // already has coords
+    if (!doc.address && !doc.city) continue;
+
+    let result = await geocodeAddress([doc.address, doc.city, doc.state, doc.zip_code, doc.country]);
+
+    if (result?.rateLimited) {
+      await sleep(1200);
+      result = await geocodeAddress([doc.address, doc.city, doc.state, doc.zip_code, doc.country]);
+    }
+
+    if (result && !result.rateLimited) {
+      doc.user_latitude = result.latitude;
+      doc.user_longitude = result.longitude;
+    }
+    // small delay so we never fire requests faster than ~8/sec
+    await sleep(120);
+  }
+  return docs;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // CREATE STORE
 // ─────────────────────────────────────────────────────────────────────────────
 const createStore = [
@@ -181,10 +244,6 @@ const getStore = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // UPDATE STORE
-// ─────────────────────────────────────────────────────────────────────────────
-// ✅ FIX: user_id is no longer required in the request body.
-//    The authenticated user's ID comes from req.user.userId (JWT token).
-//    This matches how the frontend sends data — no user_id in the payload.
 // ─────────────────────────────────────────────────────────────────────────────
 const updateStore = async (req, res) => {
   try {
@@ -659,6 +718,19 @@ const getCheckedInStores = async (req, res) => {
   }
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// BULK CREATE STORES
+// ─────────────────────────────────────────────────────────────────────────────
+// ✅ FIX: previously this never saved user_latitude/user_longitude, so every
+// bulk-uploaded store had no coordinates at all. The app then tried to
+// geocode every store's address on-device, all at once (Promise.all), which
+// Google's Geocoding API rate-limits hard — so only a few stores ever
+// resolved successfully and showed up as "nearby". Now we geocode once,
+// server-side, at upload time (sequentially, with a small delay so we don't
+// get rate-limited), and store the coordinates permanently. If your sheet
+// already has LATITUDE / LONGITUDE columns, those are used directly and
+// geocoding is skipped for that row.
+// ─────────────────────────────────────────────────────────────────────────────
 const bulkCreateStores = async (req, res) => {
   if (req.user.role !== 1) {
     return res.status(403).json({ message: "Admin access required" });
@@ -675,11 +747,18 @@ const bulkCreateStores = async (req, res) => {
   // 1. Validate & build docs first (sync, fast)
   const validDocs = [];
   for (const storeData of stores) {
-    const { store_name, address, city, state, zip_code,
-            store_email, facebook_link, daily_rates } = storeData;
+    const {
+      store_name, address, city, state, zip_code,
+      store_email, facebook_link, daily_rates,
+    } = storeData;
 
     if (!store_name) {
       results.failed.push({ store_name: storeData.store_name ?? "(unknown)", reason: "store_name is required" });
+      continue;
+    }
+
+    if (!address && !city) {
+      results.failed.push({ store_name, reason: "Address or city is required so the store can be located on the map" });
       continue;
     }
 
@@ -694,34 +773,43 @@ const bulkCreateStores = async (req, res) => {
     }
 
     validDocs.push({
-      _id:           require("uuid").v4(),
-      user_id:       "unassigned",
+      _id:            require("uuid").v4(),
+      user_id:        "unassigned",
       store_name,
-      address:       address       || null,
-      city:          city          || null,
-      state:         state         || null,
-      zip_code:      zip_code      || null,
-      store_email:   store_email   || null,
-      facebook_link: facebook_link || null,
-      daily_rates:   sanitisedRates,
-      verified:      false,
-      favorited_by:  [],
-      liked_by:      [],
-      followed_by:   [],
-      comments:      [],
+      address:        address       || null,
+      city:           city          || null,
+      state:          state         || null,
+      zip_code:       zip_code      || null,
+      store_email:    store_email   || null,
+      facebook_link:  facebook_link || null,
+      user_latitude:  null,
+      user_longitude: null,
+      daily_rates:    sanitisedRates,
+      verified:       false,
+      favorited_by:   [],
+      liked_by:       [],
+      followed_by:    [],
+      comments:       [],
     });
   }
 
-  // 2. Insert in batches of 500
+  // 2. Geocode every doc's address server-side, one at a time, using the
+  // Google Geocoding API — store owners just give an address, they never
+  // need to know their own lat/lng. Sequential + small delay so Google
+  // doesn't rate-limit/reject a big burst of simultaneous requests (which
+  // was the original bug: only a few stores ever got usable coordinates).
+  await geocodeDocsInPlace(validDocs);
+
+  // 3. Insert in batches of 500
   for (let i = 0; i < validDocs.length; i += BATCH_SIZE) {
     const batch = validDocs.slice(i, i + BATCH_SIZE);
     try {
       const inserted = await Store.insertMany(batch, { ordered: false });
-      inserted.forEach(s => results.created.push({ store_name: s.store_name, store_id: s._id }));
+      inserted.forEach(s => results.created.push({ store_name: s.store_name, store_id: s._id, geocoded: !!(s.user_latitude && s.user_longitude) }));
     } catch (err) {
       // ordered: false means partial inserts succeed; writeErrors has the failures
       if (err.insertedDocs?.length) {
-        err.insertedDocs.forEach(s => results.created.push({ store_name: s.store_name, store_id: s._id }));
+        err.insertedDocs.forEach(s => results.created.push({ store_name: s.store_name, store_id: s._id, geocoded: !!(s.user_latitude && s.user_longitude) }));
       }
       if (err.writeErrors?.length) {
         err.writeErrors.forEach(e => results.failed.push({
@@ -732,8 +820,11 @@ const bulkCreateStores = async (req, res) => {
     }
   }
 
+  const ungeocodedCount = results.created.filter(s => !s.geocoded).length;
+
   res.status(207).json({
-    message: `${results.created.length} stores created, ${results.failed.length} failed`,
+    message: `${results.created.length} stores created, ${results.failed.length} failed` +
+      (ungeocodedCount > 0 ? `, ${ungeocodedCount} created without coordinates (bad/missing address — they won't appear in "near me" until fixed)` : ""),
     created: results.created,
     failed:  results.failed,
   });
