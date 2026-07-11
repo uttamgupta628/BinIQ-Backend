@@ -74,6 +74,16 @@ const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || "AIzaSyCY-8_-SbCN
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Duplicate detection for bulk uploads
+// ─────────────────────────────────────────────────────────────────────────────
+// Matches on normalized store_name + city + state, NOT store_name alone —
+// a chain like "Bulldog Liquidators" legitimately has multiple locations,
+// so name-only matching would wrongly reject those as duplicates.
+const normalizeForDedupe = (s) => String(s || "").toLowerCase().trim().replace(/\s+/g, " ");
+const dedupeKey = (name, city, state) =>
+  `${normalizeForDedupe(name)}|${normalizeForDedupe(city)}|${normalizeForDedupe(state)}`;
+
 const geocodeAddress = async (addressParts) => {
   const address = addressParts.filter(Boolean).join(", ");
   if (!address || !GOOGLE_MAPS_API_KEY) return null;
@@ -793,16 +803,50 @@ const bulkCreateStores = async (req, res) => {
     });
   }
 
+  // 1.5 Filter out duplicates — both against stores that already exist in
+  // the database (e.g. re-uploading the same file, or the same store
+  // showing up in two different regional spreadsheets) and duplicates
+  // within this same batch. Matched on normalized store_name + city +
+  // state so a legitimate chain with the same name in different cities
+  // is NOT treated as a duplicate. Done before geocoding so we don't
+  // waste Google API calls on rows we're going to reject anyway.
+  const existingStores = await Store.find({}, { store_name: 1, city: 1, state: 1 }).lean();
+  const existingKeys = new Set(
+    existingStores.map((s) => dedupeKey(s.store_name, s.city, s.state)),
+  );
+
+  const seenInBatch = new Set();
+  const dedupedDocs = [];
+  for (const doc of validDocs) {
+    const key = dedupeKey(doc.store_name, doc.city, doc.state);
+    if (existingKeys.has(key)) {
+      results.failed.push({
+        store_name: doc.store_name,
+        reason: "Duplicate — a store with this name already exists in this city/state",
+      });
+      continue;
+    }
+    if (seenInBatch.has(key)) {
+      results.failed.push({
+        store_name: doc.store_name,
+        reason: "Duplicate — appears more than once in this upload",
+      });
+      continue;
+    }
+    seenInBatch.add(key);
+    dedupedDocs.push(doc);
+  }
+
   // 2. Geocode every doc's address server-side, one at a time, using the
   // Google Geocoding API — store owners just give an address, they never
   // need to know their own lat/lng. Sequential + small delay so Google
   // doesn't rate-limit/reject a big burst of simultaneous requests (which
   // was the original bug: only a few stores ever got usable coordinates).
-  await geocodeDocsInPlace(validDocs);
+  await geocodeDocsInPlace(dedupedDocs);
 
   // 3. Insert in batches of 500
-  for (let i = 0; i < validDocs.length; i += BATCH_SIZE) {
-    const batch = validDocs.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < dedupedDocs.length; i += BATCH_SIZE) {
+    const batch = dedupedDocs.slice(i, i + BATCH_SIZE);
     try {
       const inserted = await Store.insertMany(batch, { ordered: false });
       inserted.forEach(s => results.created.push({ store_name: s.store_name, store_id: s._id, geocoded: !!(s.user_latitude && s.user_longitude) }));
