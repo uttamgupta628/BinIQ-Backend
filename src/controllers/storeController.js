@@ -896,6 +896,54 @@ const searchStores = async (req, res) => {
   }
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE STORE (single, admin-only)
+// ─────────────────────────────────────────────────────────────────────────────
+const deleteStore = async (req, res) => {
+  if (req.user.role !== 1) {
+    return res.status(403).json({ message: "Admin access required" });
+  }
+
+  const { id } = req.params;
+  try {
+    const deleted = await Store.findOneAndDelete({ _id: id });
+    if (!deleted) {
+      return res.status(404).json({ message: "Store not found" });
+    }
+    res.json({ message: "Store deleted successfully", store_id: id });
+  } catch (error) {
+    console.error("Delete store error:", error);
+    res.status(500).json({ message: "Server error", error: error.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE ALL STORES (admin-only, requires typed confirmation from client)
+// ─────────────────────────────────────────────────────────────────────────────
+const deleteAllStores = async (req, res) => {
+  if (req.user.role !== 1) {
+    return res.status(403).json({ message: "Admin access required" });
+  }
+
+  const { confirm } = req.body;
+  if (confirm !== "DELETE ALL STORES") {
+    return res.status(400).json({
+      message: 'Confirmation required: send { "confirm": "DELETE ALL STORES" }',
+    });
+  }
+
+  try {
+    const result = await Store.deleteMany({});
+    res.json({
+      message: `Deleted ${result.deletedCount} store(s)`,
+      deletedCount: result.deletedCount,
+    });
+  } catch (error) {
+    console.error("Delete all stores error:", error);
+    res.status(500).json({ message: "Server error", error: error.message });
+  }
+};
+
 module.exports = {
   createStore,
   getStore,
@@ -915,4 +963,6 @@ module.exports = {
   getCheckedInStores,
   bulkCreateStores,
   searchStores,
+  deleteStore,      
+  deleteAllStores,  
 };

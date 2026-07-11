@@ -19,6 +19,8 @@ const {
   getCheckedInStores,
   bulkCreateStores,
   searchStores,
+  deleteStore,       
+  deleteAllStores,   
 } = require("../controllers/storeController");
 const { authenticate } = require("../utils/auth");
 
@@ -40,5 +42,7 @@ router.get("/topPerformers", authenticate, getTopStores);
 router.post("/checkin", authenticate, checkInStore);
 router.get("/checkins", authenticate, getCheckedInStores);
 router.post("/bulk-create", authenticate, bulkCreateStores);
+router.delete("/all", authenticate, deleteAllStores);   
+router.delete("/:id", authenticate, deleteStore);       
 
 module.exports = router;
