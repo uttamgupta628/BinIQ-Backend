@@ -84,6 +84,34 @@ const normalizeForDedupe = (s) => String(s || "").toLowerCase().trim().replace(/
 const dedupeKey = (name, city, state) =>
   `${normalizeForDedupe(name)}|${normalizeForDedupe(city)}|${normalizeForDedupe(state)}`;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Free geocoder — U.S. Census Bureau public Geocoder API
+// ─────────────────────────────────────────────────────────────────────────────
+// No API key, no per-request charge, no meaningful rate limit for our volume.
+// Every store in this app is a U.S. address, so this is a perfect match — it's
+// what the Census Bureau built this service for. We try this FIRST and only
+// fall back to paid Google Geocoding for the small percentage of addresses
+// it can't resolve (rural routes, brand-new construction, PO boxes, etc.).
+// Docs: https://geocoding.geo.census.gov/geocoder/
+const geocodeWithCensus = async (addressParts) => {
+  const address = addressParts.filter(Boolean).join(", ");
+  if (!address) return null;
+  try {
+    const url =
+      `https://geocoding.geo.census.gov/geocoder/locations/onelineaddress` +
+      `?address=${encodeURIComponent(address)}&benchmark=Public_AR_Current&format=json`;
+    const res = await fetch(url);
+    const json = await res.json();
+    const match = json?.result?.addressMatches?.[0];
+    if (match?.coordinates?.y != null && match?.coordinates?.x != null) {
+      return { latitude: match.coordinates.y, longitude: match.coordinates.x };
+    }
+  } catch (err) {
+    console.error("Census geocode error for", address, err.message);
+  }
+  return null; // no match — caller falls back to Google
+};
+
 const geocodeAddress = async (addressParts) => {
   const address = addressParts.filter(Boolean).join(", ");
   if (!address || !GOOGLE_MAPS_API_KEY) return null;
@@ -108,32 +136,49 @@ const geocodeAddress = async (addressParts) => {
 };
 
 /**
- * Geocode a batch of docs sequentially with a small delay between calls
- * (Google's free tier allows ~50 requests/sec, but bursts of many
- * concurrent Promise.all calls get silently rejected/rate-limited —
- * this is why only a handful of bulk-uploaded stores used to get
- * coordinates). Docs that already have lat/lng (from LATITUDE/LONGITUDE
- * columns in the sheet) are skipped entirely.
+ * Geocode a batch of docs sequentially. Docs that already have lat/lng
+ * (from LATITUDE/LONGITUDE columns in the sheet) are skipped entirely —
+ * that's free and instant.
+ *
+ * For everything else: try the free Census geocoder first. Only when
+ * Census has no match do we spend a paid Google Geocoding call. In
+ * practice most well-formed U.S. street addresses resolve on Census,
+ * so this should cut Google usage by the large majority for a bulk
+ * upload of typical store addresses.
  */
 const geocodeDocsInPlace = async (docs) => {
+  let censusHits = 0;
+  let googleFallbacks = 0;
+
   for (const doc of docs) {
     if (doc.user_latitude && doc.user_longitude) continue; // already has coords
     if (!doc.address && !doc.city) continue;
 
-    let result = await geocodeAddress([doc.address, doc.city, doc.state, doc.zip_code, doc.country]);
-
-    if (result?.rateLimited) {
-      await sleep(1200);
-      result = await geocodeAddress([doc.address, doc.city, doc.state, doc.zip_code, doc.country]);
+    // 1. Free — U.S. Census Bureau geocoder
+    let result = await geocodeWithCensus([doc.address, doc.city, doc.state, doc.zip_code]);
+    if (result) {
+      censusHits++;
+    } else {
+      // 2. Paid fallback — only reached when Census couldn't resolve it
+      googleFallbacks++;
+      let googleResult = await geocodeAddress([doc.address, doc.city, doc.state, doc.zip_code, doc.country]);
+      if (googleResult?.rateLimited) {
+        await sleep(1200);
+        googleResult = await geocodeAddress([doc.address, doc.city, doc.state, doc.zip_code, doc.country]);
+      }
+      if (googleResult && !googleResult.rateLimited) result = googleResult;
     }
 
-    if (result && !result.rateLimited) {
+    if (result) {
       doc.user_latitude = result.latitude;
       doc.user_longitude = result.longitude;
     }
-    // small delay so we never fire requests faster than ~8/sec
-    await sleep(120);
+    // small politeness delay — Census has no hard limit, but this also
+    // keeps us well under Google's rate limit for the fallback calls
+    await sleep(80);
   }
+
+  console.log(`Geocoding summary: ${censusHits} resolved free via Census, ${googleFallbacks} fell back to Google`);
   return docs;
 };
 
@@ -731,16 +776,7 @@ const getCheckedInStores = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // BULK CREATE STORES
 // ─────────────────────────────────────────────────────────────────────────────
-// ✅ FIX: previously this never saved user_latitude/user_longitude, so every
-// bulk-uploaded store had no coordinates at all. The app then tried to
-// geocode every store's address on-device, all at once (Promise.all), which
-// Google's Geocoding API rate-limits hard — so only a few stores ever
-// resolved successfully and showed up as "nearby". Now we geocode once,
-// server-side, at upload time (sequentially, with a small delay so we don't
-// get rate-limited), and store the coordinates permanently. If your sheet
-// already has LATITUDE / LONGITUDE columns, those are used directly and
-// geocoding is skipped for that row.
-// ─────────────────────────────────────────────────────────────────────────────
+
 const bulkCreateStores = async (req, res) => {
   if (req.user.role !== 1) {
     return res.status(403).json({ message: "Admin access required" });
@@ -751,7 +787,7 @@ const bulkCreateStores = async (req, res) => {
     return res.status(400).json({ message: "stores array is required" });
   }
 
-  const BATCH_SIZE = 500; // process 500 at a time
+  const BATCH_SIZE = 500;
   const results = { created: [], failed: [] };
 
   // 1. Validate & build docs first (sync, fast)
@@ -803,13 +839,6 @@ const bulkCreateStores = async (req, res) => {
     });
   }
 
-  // 1.5 Filter out duplicates — both against stores that already exist in
-  // the database (e.g. re-uploading the same file, or the same store
-  // showing up in two different regional spreadsheets) and duplicates
-  // within this same batch. Matched on normalized store_name + city +
-  // state so a legitimate chain with the same name in different cities
-  // is NOT treated as a duplicate. Done before geocoding so we don't
-  // waste Google API calls on rows we're going to reject anyway.
   const existingStores = await Store.find({}, { store_name: 1, city: 1, state: 1 }).lean();
   const existingKeys = new Set(
     existingStores.map((s) => dedupeKey(s.store_name, s.city, s.state)),
@@ -837,11 +866,6 @@ const bulkCreateStores = async (req, res) => {
     dedupedDocs.push(doc);
   }
 
-  // 2. Geocode every doc's address server-side, one at a time, using the
-  // Google Geocoding API — store owners just give an address, they never
-  // need to know their own lat/lng. Sequential + small delay so Google
-  // doesn't rate-limit/reject a big burst of simultaneous requests (which
-  // was the original bug: only a few stores ever got usable coordinates).
   await geocodeDocsInPlace(dedupedDocs);
 
   // 3. Insert in batches of 500
@@ -897,20 +921,17 @@ const searchStores = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DELETE STORE (single, admin-only)
+// DELETE STORE (single, admin only)
 // ─────────────────────────────────────────────────────────────────────────────
 const deleteStore = async (req, res) => {
   if (req.user.role !== 1) {
     return res.status(403).json({ message: "Admin access required" });
   }
-
-  const { id } = req.params;
+  const { store_id } = req.params;
   try {
-    const deleted = await Store.findOneAndDelete({ _id: id });
-    if (!deleted) {
-      return res.status(404).json({ message: "Store not found" });
-    }
-    res.json({ message: "Store deleted successfully", store_id: id });
+    const deleted = await Store.findOneAndDelete({ _id: store_id });
+    if (!deleted) return res.status(404).json({ message: "Store not found" });
+    res.json({ message: "Store deleted successfully", store_id });
   } catch (error) {
     console.error("Delete store error:", error);
     res.status(500).json({ message: "Server error", error: error.message });
@@ -918,24 +939,22 @@ const deleteStore = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DELETE ALL STORES (admin-only, requires typed confirmation from client)
+// DELETE ALL STORES (admin only)
 // ─────────────────────────────────────────────────────────────────────────────
 const deleteAllStores = async (req, res) => {
   if (req.user.role !== 1) {
     return res.status(403).json({ message: "Admin access required" });
   }
-
   const { confirm } = req.body;
   if (confirm !== "DELETE ALL STORES") {
     return res.status(400).json({
-      message: 'Confirmation required: send { "confirm": "DELETE ALL STORES" }',
+      message: 'Confirmation required. Send { "confirm": "DELETE ALL STORES" } in the request body to proceed.',
     });
   }
-
   try {
     const result = await Store.deleteMany({});
     res.json({
-      message: `Deleted ${result.deletedCount} store(s)`,
+      message: `Deleted ${result.deletedCount} store${result.deletedCount === 1 ? "" : "s"}`,
       deletedCount: result.deletedCount,
     });
   } catch (error) {
@@ -963,6 +982,6 @@ module.exports = {
   getCheckedInStores,
   bulkCreateStores,
   searchStores,
-  deleteStore,      
-  deleteAllStores,  
+  deleteStore,
+  deleteAllStores,
 };

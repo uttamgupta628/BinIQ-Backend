@@ -24,7 +24,7 @@ const {
 } = require("../controllers/storeController");
 const { authenticate } = require("../utils/auth");
 
-router.get("/search", searchStores);                        // ← public: no auth (used on claim form before login)
+router.get("/search", searchStores);                      
 router.post("/", authenticate, createStore);
 router.get("/my-store", authenticate, getStore);
 router.put("/", authenticate, updateStore);
